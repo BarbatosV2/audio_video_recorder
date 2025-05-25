@@ -6,8 +6,7 @@ import os
 import time
 import re
 import sys
-import asyncio # Added for WebSocket audio
-import websockets # Added for WebSocket audio
+import numpy as np # Added for audio visualization
 import argparse # Added for command-line argument parsing
 
 # --- Configuration ---
@@ -17,16 +16,13 @@ RECORD_FOLDER = "record"  # Name of the subfolder for recordings
 IP_CAM_URL = "http://172.20.10.2:81/stream"  # Your IP camera stream URL
                                              # Set to None or "" to disable IP camera recording
 
-# WebSocket Audio settings (for IP camera audio source)
-WS_AUDIO_URL = "ws://172.20.10.2:82"       # Your WebSocket audio stream URL (e.g., from an IP camera)
-                                           # Set to None or "" to disable WebSocket audio recording
 # USB Webcam settings
 USB_CAM_INDEX = 0  # Index of the USB webcam (usually 0 for the default)
                    # Set to None to disable USB camera recording
 
 # Audio settings
 AUDIO_ENABLED = True  # Set to False to disable audio recording
-AUDIO_RATE = 16000    # Sample rate for audio
+AUDIO_RATE = 44100    # Sample rate for audio
 AUDIO_CHUNK_SIZE = 1024 # Number of frames per buffer
 AUDIO_CHANNELS = 1      # 1 for mono, 2 for stereo
 AUDIO_FORMAT = pyaudio.paInt16 # Sample format and size
@@ -36,31 +32,20 @@ DEFAULT_AUDIO_DEVICE_INDEX = None # Use None for system's default input device, 
 VIDEO_FPS_DEFAULT = 20.0  # Default FPS if camera doesn't provide it or for consistency
 VIDEO_FOURCC = 'mp4v'     # Codec for MP4. Common options: 'mp4v', 'XVID', 'MJPG'.
                           # 'H264' might require a GStreamer backend for OpenCV.
-# Determine audio sample width in bytes based on AUDIO_FORMAT
-try:
-    # Temporary PyAudio instance to get sample width
-    _pyaudio_instance_for_format = pyaudio.PyAudio()
-    AUDIO_SAMPLE_WIDTH_BYTES = _pyaudio_instance_for_format.get_sample_size(AUDIO_FORMAT)
-    _pyaudio_instance_for_format.terminate()
-except Exception as e:
-    print(f"Warning: Could not determine audio sample width from PyAudio format {AUDIO_FORMAT}: {e}. Defaulting to 2 bytes.")
-    AUDIO_SAMPLE_WIDTH_BYTES = 2 # Default for paInt16
+
 
 def get_next_session_index(folder_path: str) -> int:
     """
     Determines the next session index by looking for files matching the pattern
-    (video_ip_N, video_usb_N, audio_mic_N, audio_ws_N) in the given folder.
+    (video_ip_N, video_usb_N, audio_N) in the given folder.
     The next session index will be max_found_index + 1.
     """
     if not os.path.isdir(folder_path):
         return 1
     
     max_index = 0
-    # Regex to find _N part in filenames like:
-    # video_ip_N.mp4, video_usb_N.mp4, audio_mic_N.wav, audio_ws_N.wav
-    pattern = re.compile(
-        r"(?:video_ip|video_usb|audio_mic|audio_ws)_(\d+)\.(?:mp4|wav)"
-    )
+    # Regex to find _N part in filenames like video_ip_N.mp4, video_usb_N.mp4, audio_N.wav
+    pattern = re.compile(r"(?:video_ip|video_usb|audio)_(\d+)\.(?:mp4|wav)")
     
     for f_name in os.listdir(folder_path):
         match = pattern.match(f_name)
@@ -83,7 +68,10 @@ def video_recorder(source, output_filename: str, stop_event: threading.Event,
     'source' can be an IP camera URL (string) or a device index (int).
     """
     print(f"Attempting to open video source: {source}")
-    cap = cv2.VideoCapture(source)
+    if isinstance(source, str) and source.lower().startswith("http"):
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG) # CAP_FFMPEG can sometimes help with IP streams
+    else:
+        cap = cv2.VideoCapture(source)
 
     if not cap.isOpened():
         print(f"Error: Could not open video source '{source}'. This recording thread will exit.")
@@ -123,24 +111,25 @@ def video_recorder(source, output_filename: str, stop_event: threading.Event,
     
     frame_count = 0
     start_time = time.time()
-    window_title = f"LIVE Preview: {source}" # Unique window title for this source
+    
+    window_name = f"Video Feed: {source}"
+    cv2.namedWindow(window_name)
 
     while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
-            # Window will be destroyed after the loop
             print(f"Warning: Could not read frame from source '{source}'. Stream may have ended or an error occurred.")
             break
         out.write(frame)
         frame_count += 1
+
+        cv2.imshow(window_name, frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print(f"'q' pressed in window {window_name}. Signaling stop for all recordings.")
+            stop_event.set()
+            break
         # A small sleep can be added here if CPU usage is too high,
         # e.g., time.sleep(0.001), but cap.read() is often blocking.
-
-        # Display the current frame
-        cv2.imshow(window_title, frame)
-        # cv2.waitKey(1) is crucial for imshow to work and update the window.
-        # It also processes window events. A 1ms delay is generally negligible.
-        cv2.waitKey(1)
 
     end_time = time.time()
     duration = end_time - start_time
@@ -149,7 +138,7 @@ def video_recorder(source, output_filename: str, stop_event: threading.Event,
     
     cap.release()
     out.release()
-    cv2.destroyWindow(window_title) # Close the specific preview window for this thread
+    cv2.destroyWindow(window_name)
 
 
 def audio_recorder(output_filename: str, stop_event: threading.Event, 
@@ -184,11 +173,45 @@ def audio_recorder(output_filename: str, stop_event: threading.Event,
 
     print(f"Recording audio to '{output_filename}' (Rate: {rate}, Channels: {channels})")
     frames = []
+
+    audio_window_name = "Audio Level"
+    cv2.namedWindow(audio_window_name)
+    vis_frame_height = 100
+    vis_frame_width = 400 # Increased width for better waveform display
     
     while not stop_event.is_set():
         try:
             data = stream.read(chunk_size, exception_on_overflow=False) # Avoid crashing on overflow
             frames.append(data)
+
+            # Audio visualization
+            try:
+                audio_data_np = np.frombuffer(data, dtype=np.int16)
+                
+                vis_frame = np.zeros((vis_frame_height, vis_frame_width, 3), dtype=np.uint8)
+                
+                # Max amplitude for int16
+                max_amplitude = 32767.0 
+                
+                num_samples = len(audio_data_np)
+                
+                if num_samples > 0:
+                    # Create an array of x-coordinates, scaled to frame width
+                    x_coords = np.linspace(0, vis_frame_width - 1, num_samples, dtype=int)
+                    
+                    # Scale y-coordinates (amplitude)
+                    # y_normalized = audio_data_np / max_amplitude  (range -1 to 1)
+                    # y_pixels = (vis_frame_height / 2) * (1 - y_normalized)
+                    y_coords = (vis_frame_height / 2) * (1 - audio_data_np.astype(np.float32) / max_amplitude)
+                    y_coords = np.clip(y_coords, 0, vis_frame_height - 1).astype(int)
+
+                    points = np.column_stack((x_coords, y_coords))
+                    cv2.polylines(vis_frame, [points], isClosed=False, color=(0, 255, 0), thickness=1)
+                cv2.line(vis_frame, (0, vis_frame_height // 2), (vis_frame_width, vis_frame_height // 2), (100, 100, 100), 1) # Center line
+                cv2.imshow(audio_window_name, vis_frame)
+            except Exception as e_vis:
+                print(f"Warning: Error during audio visualization: {e_vis}")
+
         except IOError as e:
             # pyaudio.paInputOverflowed is a common one if system is busy
             if hasattr(pyaudio, 'paInputOverflowed') and e.errno == pyaudio.paInputOverflowed:
@@ -198,6 +221,12 @@ def audio_recorder(output_filename: str, stop_event: threading.Event,
                 break 
         except Exception as e:
             print(f"Unexpected error during audio read: {e}. Stopping audio recording.")
+            break
+        
+        # Check for 'q' press in audio window
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print(f"'q' pressed in window {audio_window_name}. Signaling stop for all recordings.")
+            stop_event.set()
             break
 
     print("Finished audio recording. Processing and saving to file...")
@@ -209,6 +238,7 @@ def audio_recorder(output_filename: str, stop_event: threading.Event,
         print(f"Error stopping/closing audio stream: {e}")
     
     audio_interface.terminate()
+    cv2.destroyWindow(audio_window_name)
 
     if not frames:
         print(f"No audio frames recorded for '{output_filename}'. File will not be created.")
@@ -225,75 +255,8 @@ def audio_recorder(output_filename: str, stop_event: threading.Event,
         print(f"Error saving WAV file '{output_filename}': {e}")
 
 
-async def websocket_audio_consumer(uri: str, stop_event: threading.Event, frames_list: list, output_filename_debug: str):
-    """
-    Connects to a WebSocket audio stream and appends received binary data to frames_list.
-    Stops when stop_event is set.
-    """
-    print(f"Attempting to connect to WebSocket audio stream: {uri} for {output_filename_debug}")
-    try:
-        async with websockets.connect(uri) as websocket:
-            print(f"Successfully connected to WebSocket audio stream: {uri}")
-            while not stop_event.is_set():
-                try:
-                    # Timeout allows checking stop_event periodically
-                    message = await asyncio.wait_for(websocket.recv(), timeout=0.1)
-                    if isinstance(message, bytes):
-                        frames_list.append(message)
-                    # else:
-                        # print(f"WS Audio ({output_filename_debug}): Received non-bytes message: {type(message)}")
-                except asyncio.TimeoutError:
-                    continue  # No message received, loop to check stop_event
-                except websockets.exceptions.ConnectionClosed as e:
-                    print(f"WS Audio ({output_filename_debug}): Connection closed by server ({uri}): {e}")
-                    break
-                except Exception as e:
-                    print(f"WS Audio ({output_filename_debug}): Error receiving from WebSocket ({uri}): {e}")
-                    break
-    except websockets.exceptions.InvalidURI:
-        print(f"Error: Invalid WebSocket URI: {uri}. WebSocket audio recording for {output_filename_debug} will not start.")
-    except ConnectionRefusedError:
-        print(f"Error: Connection refused for WebSocket: {uri}. Ensure the server is running. WebSocket audio recording for {output_filename_debug} will not start.")
-    except Exception as e:
-        print(f"Error connecting to WebSocket {uri} for {output_filename_debug}: {e}. WebSocket audio recording will not start.")
-    finally:
-        print(f"WebSocket audio consumer for {output_filename_debug} stopping.")
-
-
-def websocket_audio_recorder_thread_target(uri: str, output_filename: str, stop_event: threading.Event,
-                                           rate: int, channels: int, sample_width_bytes: int):
-    """
-    Thread target for recording audio from a WebSocket stream.
-    Manages an asyncio event loop for websocket_audio_consumer and saves the audio to a WAV file.
-    """
-    frames = []
-    print(f"Starting WebSocket audio recording to '{output_filename}' from '{uri}' (Rate: {rate}, Channels: {channels}, SampleWidth: {sample_width_bytes} bytes)")
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(websocket_audio_consumer(uri, stop_event, frames, output_filename))
-    except Exception as e:
-        print(f"Error in WebSocket audio consumer event loop for {output_filename}: {e}")
-    finally:
-        loop.close()
-
-    print(f"Finished WebSocket audio data collection for '{output_filename}'. Processing and saving to file...")
-    if not frames:
-        print(f"No audio frames received from WebSocket for '{output_filename}'. File will not be created.")
-        return
-    try:
-        with wave.open(output_filename, 'wb') as wave_file:
-            wave_file.setnchannels(channels)
-            wave_file.setsampwidth(sample_width_bytes)
-            wave_file.setframerate(rate)
-            wave_file.writeframes(b''.join(frames))
-        print(f"WebSocket audio saved to '{output_filename}'")
-    except Exception as e:
-        print(f"Error saving WAV file from WebSocket stream '{output_filename}': {e}")
-
 def main():
-    # Create record folder if it doesn't exist
+    # Createing the recording folder if it doesn't exist
     record_folder_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RECORD_FOLDER)
     if not os.path.exists(record_folder_path):
         try:
@@ -356,7 +319,7 @@ def main():
         if not (args.device and args.device.lower() in ["web", "ip"] and not IP_CAM_URL): # Avoid redundant message if warning already printed
             print("IP Camera recording is not active for this session.")
 
-    # --- Setup USB Camera Recording Thread ---
+    # Setup USB Camera Recording Thread
     if should_record_usb_cam: # usb_cam_index_to_use will be set if this is true
         video_usb_filename = os.path.join(record_folder_path, f"video_usb_{session_index}.mp4")
         thread_usb_cam = threading.Thread(target=video_recorder, 
@@ -366,37 +329,15 @@ def main():
     else:
         print("USB Camera recording is not active for this session.")
         
-    # --- Setup Audio Recording Thread(s) ---
-    audio_thread_started_this_session = False
-    # Prioritize WebSocket audio if --device ip is used and WS_AUDIO_URL is configured
-    if should_record_ip_cam and WS_AUDIO_URL: # IP Cam video is active, and WS Audio URL is set
-        audio_ws_filename = os.path.join(record_folder_path, f"audio_ws_{session_index}.wav")
-        thread_ws_audio = threading.Thread(
-            target=websocket_audio_recorder_thread_target,
-            args=(WS_AUDIO_URL, audio_ws_filename, stop_event, AUDIO_RATE, AUDIO_CHANNELS, AUDIO_SAMPLE_WIDTH_BYTES),
-            name=f"WSAudioRecorder-{session_index}"
-        )
-        active_threads.append(thread_ws_audio)
-        audio_thread_started_this_session = True
-        print(f"WebSocket audio recording will be attempted from {WS_AUDIO_URL} to {audio_ws_filename}.")
-    elif should_record_ip_cam and not WS_AUDIO_URL:
-        print("IP Camera recording is active, but WS_AUDIO_URL is not configured. No IP-based audio will be recorded.")
-
-    # Fallback to local microphone audio if not doing IP audio or if IP audio isn't configured/wanted
-    if not audio_thread_started_this_session and AUDIO_ENABLED:
-        # This block runs if:
-        # 1. Not an IP camera session (e.g., USB cam only, or no video args) AND AUDIO_ENABLED.
-        # 2. It IS an IP camera session, WS_AUDIO_URL is NOT set, AND AUDIO_ENABLED (for local mic fallback).
-        audio_mic_filename = os.path.join(record_folder_path, f"audio_mic_{session_index}.wav")
-        thread_mic_audio = threading.Thread(target=audio_recorder,
-                                        args=(audio_mic_filename, stop_event, AUDIO_RATE, AUDIO_CHUNK_SIZE, AUDIO_CHANNELS, AUDIO_FORMAT, DEFAULT_AUDIO_DEVICE_INDEX),
-                                        name=f"MicAudioRecorder-{session_index}")
-        active_threads.append(thread_mic_audio)
-        audio_thread_started_this_session = True
-        print(f"Local microphone audio recording is active, saving to {audio_mic_filename}.")
-    
-    if not audio_thread_started_this_session:
-        print("No audio recording sources (WebSocket or local microphone) are active for this session.")
+    # Setup Audio Recording Thread 
+    if AUDIO_ENABLED:
+        audio_filename = os.path.join(record_folder_path, f"audio_{session_index}.wav")
+        thread_audio = threading.Thread(target=audio_recorder, 
+                                        args=(audio_filename, stop_event, AUDIO_RATE, AUDIO_CHUNK_SIZE, AUDIO_CHANNELS, AUDIO_FORMAT, DEFAULT_AUDIO_DEVICE_INDEX),
+                                        name=f"AudioRecorder-{session_index}")
+        active_threads.append(thread_audio)
+    else:
+        print("Audio recording is disabled by configuration.")
 
     if not active_threads:
         print("No recording sources (video or audio) are active for this session. Exiting.")
@@ -422,10 +363,10 @@ def main():
                         break 
                 except EOFError: # Handle if stdin is unexpectedly closed
                     print("\nEOF on stdin. Assuming non-interactive mode now. Send SIGINT (Ctrl+C) to stop.")
-                    is_interactive = False # Switch to non-interactive wait
-                    break # Break from input loop to non-interactive wait loop
+                    is_interactive = False # Switch to non interactive wait
+                    break # Break from input loop to non interactive wait loop
         
-        # Non-interactive wait loop (or if switched from interactive)
+        # Non interactive wait loop (or if switched from interactive)
         while not stop_event.is_set() and any(t.is_alive() for t in active_threads):
             time.sleep(0.5) # Keep main thread alive, periodically check stop_event
 
@@ -451,6 +392,10 @@ def main():
 
     print(f"\nAll recording operations for session {session_index} concluded.")
     print(f"Files should be in the '{record_folder_path}' directory.")
+    # A final call to destroy all OpenCV windows, in case some were missed or main loop exited abruptly.
+    # However, individual destroyWindow calls in threads are generally preferred for cleaner shutdown.
+    # If threads ensure their windows are closed, this might not be strictly necessary.
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
